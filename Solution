@@ -1,0 +1,205 @@
+import numpy as np
+import pandas as pd
+
+import plotly.graph_objs as go
+
+from ostk.mathematics.objects import RealInterval
+
+from ostk.physics.units import Length
+from ostk.physics.units import Angle
+from ostk.physics.time import Scale
+from ostk.physics.time import Instant
+from ostk.physics.time import Duration
+from ostk.physics.time import Interval
+from ostk.physics.time import DateTime
+from ostk.physics.time import Time
+from ostk.physics.coordinate.spherical import LLA
+from ostk.physics.coordinate.spherical import AER
+from ostk.physics.coordinate import Position
+from ostk.physics.coordinate import Frame
+from ostk.physics import Environment
+from ostk.physics.environment.objects.celestial_bodies import Moon
+
+from ostk.astrodynamics import Trajectory
+from ostk.astrodynamics.trajectory import Orbit
+from ostk.astrodynamics.trajectory.orbit.models import Kepler
+from ostk.astrodynamics.trajectory.orbit.models.kepler import COE
+from ostk.astrodynamics.trajectory.orbit.models import SGP4
+from ostk.astrodynamics.trajectory.orbit.models.sgp4 import TLE
+from ostk.astrodynamics import Access
+from ostk.astrodynamics.access import Generator as AccessGenerator
+
+environment = Environment.default()
+moon = environment.access_celestial_object_with_name("Moon")
+
+##################################### Millenium Falcon's final orbit ##########################################
+
+a = Moon.equatorial_radius + Length.kilometers(550.0)
+e = 0.0
+i = Angle.degrees(97.8893)
+raan = Angle.degrees(120.0)
+aop = Angle.degrees(0.0)
+nu = Angle.degrees(0.0)
+
+coe = COE(a, e, i, raan, aop, nu)
+epoch = Instant.date_time(DateTime.parse("2021-05-12 17:00:00"), Scale.UTC)
+
+kepler = Kepler(coe, epoch, moon, Kepler.PerturbationType.No)
+
+orbital_model = kepler
+
+falcon_orbit = Orbit(orbital_model, moon)
+
+##########################################  Ground systems  ###################################################
+
+## Rebellion's ground station ##
+
+latitude = Angle.degrees(78.230298)
+longitude = Angle.degrees(-75.823810)
+altitude = Length.meters(30.0)
+
+azimuth_range = RealInterval.closed(0.0, 360.0) # [deg]
+elevation_range = RealInterval.closed(0.0, 360.0) # [deg]
+range_range = RealInterval.closed(0.0, 1000e3) # [m]
+
+## Empires's laser canon ##
+
+#latitude = Angle.degrees(53.120992)
+#longitude = Angle.degrees(15.231224)
+#altitude = Length.meters(30.0)
+
+#mask = {0.0: 90.0, 45.0: 0.0,135.0: 90.0} # [deg]
+#range_range = RealInterval.closed(0.0, 10000e3) # [m]
+
+################################################  Access  ######################################################
+
+from_lla = LLA(latitude, longitude, altitude)
+from_position = Position.meters(from_lla.to_cartesian(Moon.equatorial_radius, Moon.flattening), Frame.ITRF())
+from_trajectory = Trajectory.position(from_position)
+
+start_instant = Instant.date_time(DateTime.parse("2021-05-12 17:00:00"), Scale.UTC)
+end_instant = Instant.date_time(DateTime.parse("2021-05-12 21:00:00"), Scale.UTC)
+interval = Interval.closed(start_instant, end_instant)
+
+access_generator = AccessGenerator.aer_ranges(azimuth_range, elevation_range, range_range, environment)
+#access_generator = AccessGenerator.aer_mask(mask, range_range, environment)
+
+# Computing
+accesses = access_generator.compute_accesses(interval, from_trajectory, falcon_orbit)
+print(accesses)
+
+def compute_lla (state):
+    
+    lla = LLA.cartesian(state.get_position().in_frame(Frame.ITRF(), state.get_instant()).get_coordinates(), 
+                        Moon.equatorial_radius, Moon.flattening)
+
+    return [float(lla.get_latitude().in_degrees()), float(lla.get_longitude().in_degrees()), 
+            float(lla.get_altitude().in_meters())]
+
+def compute_aer (instant, from_lla, to_position):
+    
+    nedFrame = moon.get_frame_at(from_lla, Moon.FrameType.NED)
+
+    fromPosition_NED = from_position.in_frame(nedFrame, instant)
+    sunPosition_NED = to_position.in_frame(nedFrame, instant)
+
+    aer = AER.from_position_to_position(fromPosition_NED, sunPosition_NED, True)
+    
+    return [float(aer.get_azimuth().in_degrees()), float(aer.get_elevation().in_degrees()), 
+            float(aer.get_range().in_meters())]
+
+def compute_time_lla_aer_state (state):
+    
+    instant = state.get_instant()
+    
+    lla = compute_lla(state)
+    aer = compute_aer(instant, from_lla, state.get_position().in_frame(Frame.ITRF(), state.get_instant()))
+
+    return [instant, lla[0], lla[1], lla[2], aer[0], aer[1], aer[2]]
+
+def compute_trajectory_geometry (aTrajectory, anInterval):
+
+    return [compute_lla(state) for state in aTrajectory.get_states_at(anInterval.generate_grid(
+        Duration.minutes(1.0)))]
+
+def compute_access_geometry (access):
+
+    return [compute_time_lla_aer_state(state) for state in falcon_orbit.get_states_at(
+        access.get_interval().generate_grid(Duration.seconds(1.0)))]
+
+
+# Outputs
+falcon_orbit_geometry_df = pd.DataFrame(compute_trajectory_geometry(falcon_orbit, interval), 
+                                           columns=['Latitude', 'Longitude', 'Altitude'])
+falcon_orbit_geometry_df.head()
+
+access_geometry_dfs = [pd.DataFrame(compute_access_geometry(access), columns=['Time', 'Latitude', 'Longitude', 
+                                                                              'Altitude', 'Azimuth', 
+                                                                              'Elevation', 'Range']) 
+                                                                               for access in accesses]
+
+############################################  Visualization  ###################################################
+
+data = []
+
+# Target geometry
+
+data.append(
+    dict(
+        type = 'scattergeo',
+        lon = [float(longitude.in_degrees())],
+        lat = [float(latitude.in_degrees())],
+        mode = 'markers',
+        marker = dict(
+            size = 10,
+            color = 'orange'
+        )
+    )
+)
+
+# Orbit geometry
+
+data.append(
+    dict(
+        type = 'scattergeo',
+        lon = falcon_orbit_geometry_df['Longitude'],
+        lat = falcon_orbit_geometry_df['Latitude'],
+        mode = 'lines',
+        line = dict(
+            width = 1,
+            color = 'rgba(0, 0, 0, 0.1)',
+        )
+    )
+)
+
+# Access geometry
+
+for access_geometry_df in access_geometry_dfs:
+    
+    data.append(
+        dict(
+            type = 'scattergeo',
+            lon = access_geometry_df['Longitude'],
+            lat = access_geometry_df['Latitude'],
+            mode = 'lines',
+            line = dict(
+                width = 1,
+                color = 'red',
+            )
+        )
+    )
+    
+layout = dict(
+        title = None,
+        showlegend = False,
+        height = 1000,
+        geo = dict(
+            showland = True,
+            landcolor = 'rgb(243, 243, 243)',
+            countrycolor = 'rgb(204, 204, 204)',
+        ),
+    )
+    
+figure = go.Figure(data = data, layout = layout)
+
+figure.show()
